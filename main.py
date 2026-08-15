@@ -1,6 +1,9 @@
+import gc
 import random
 import re
 import shutil
+import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -124,6 +127,21 @@ RUN_LOCK = threading.Lock()
 HUD_CHECK_TRIGGER = False
 OCR_WARNED = False
 OCR_SCAN_ACTIVE = False
+CURRENT_MODEL_NAME = None
+CURRENT_CONFIDENCE_THRESHOLD = 0.7
+ACTIVE_WAYPOINT = None
+START_CONFIG = None
+MODEL_READY = False
+WAYPOINT_DB_PATH = ROOT / "waypoints.db"
+START_CONFIG_EVENT = threading.Event()
+
+MOVEMENT_CALIBRATION = {
+    'w': {'dx': 0, 'dz': 1},
+    'a': {'dx': -1, 'dz': 0},
+    's': {'dx': 0, 'dz': -1},
+    'd': {'dx': 1, 'dz': 0},
+}
+CALIBRATION_READY = False
 
 
 def ensure_ocr_ready():
@@ -144,6 +162,18 @@ def ensure_ocr_ready():
     return True
 
 
+def clear_input_buffer():
+    """stdin 버퍼를 정리합니다."""
+    try:
+        import os
+        if sys.platform == 'win32':
+            os.system('cls')
+            sys.stdout.flush()
+            sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def set_running(value):
     global RUNNING
     with RUN_LOCK:
@@ -155,16 +185,343 @@ def get_running():
         return RUNNING
 
 
+def init_waypoints_db():
+    conn = sqlite3.connect(WAYPOINT_DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS waypoints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            x REAL NOT NULL,
+            z REAL NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_waypoints():
+    conn = sqlite3.connect(WAYPOINT_DB_PATH)
+    rows = conn.execute("SELECT id, name, x, z FROM waypoints ORDER BY id ASC").fetchall()
+    conn.close()
+    return rows
+
+
+def add_waypoint_record(name, x_value, z_value):
+    conn = sqlite3.connect(WAYPOINT_DB_PATH)
+    conn.execute(
+        "INSERT INTO waypoints (name, x, z) VALUES (?, ?, ?)",
+        (name.strip(), float(x_value), float(z_value)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def prompt_add_waypoint():
+    print("\n[F5] 좌표 추가")
+    clear_input_buffer()
+    
+    rows = load_waypoints()
+    if rows:
+        print("[F5] 기존 좌표 목록:")
+        for idx, (_, name, x_value, z_value) in enumerate(rows, start=1):
+            print(f"  {idx}. {name} | X={x_value} | Z={z_value}")
+        print()
+    
+    name = input("이름 입력: ").strip()
+    if not name:
+        print("[F5] 이름이 비어 있습니다.")
+        return
+
+    while True:
+        x_raw = input("X 값 입력: ").strip()
+        z_raw = input("Z 값 입력: ").strip()
+        try:
+            x_value = float(x_raw)
+            z_value = float(z_raw)
+            break
+        except ValueError:
+            print("[F5] X/Z는 숫자로 입력해 주세요.")
+
+    add_waypoint_record(name, x_value, z_value)
+    print(f"[F5] 저장 완료: {name} / X={x_value} / Z={z_value}")
+
+
+def prompt_select_run_config():
+    global ACTIVE_WAYPOINT, START_CONFIG, CURRENT_MODEL_NAME, CURRENT_CONFIDENCE_THRESHOLD, MODEL_READY
+    clear_input_buffer()
+
+    model_names = get_model_names()
+    if not model_names:
+        print("[F6] 사용 가능한 모델이 없습니다. 먼저 학습된 모델을 생성해 주세요.")
+        return
+
+    print("\n[F6] 모델 선택")
+    for idx, name in enumerate(model_names, start=1):
+        print(f"{idx}. {name}")
+
+    while True:
+        model_choice = input("모델 번호 선택: ").strip()
+        try:
+            model_index = int(model_choice) - 1
+            if 0 <= model_index < len(model_names):
+                selected_model = model_names[model_index]
+                break
+        except ValueError:
+            pass
+        print("[F6] 올바른 모델 번호를 입력해 주세요.")
+
+    while True:
+        conf_raw = input("유사도 입력 (기본값 0.7, 엔터로 자동 적용): ").strip()
+        if not conf_raw:
+            confidence = 0.7
+            print(f"[F6] 유사도 기본값 설정됨: {confidence}")
+            break
+        try:
+            confidence = float(conf_raw)
+            if 0.0 <= confidence <= 1.0:
+                break
+        except ValueError:
+            pass
+        print("[F6] 유사도는 0.0 ~ 1.0 범위의 숫자로 입력해 주세요.")
+
+    rows = load_waypoints()
+    if not rows:
+        print("[F6] 저장된 좌표가 없습니다. 먼저 F5로 좌표를 추가해 주세요.")
+        return
+
+    print("\n[F6] 기준 좌표 선택")
+    for idx, (_, name, x_value, z_value) in enumerate(rows, start=1):
+        print(f"{idx}. {name} | X={x_value} | Z={z_value}")
+
+    while True:
+        waypoint_choice = input("좌표 번호 선택 (엔터 입력 시 취소): ").strip()
+        if not waypoint_choice:
+            print("[F6] 선택 취소")
+            return
+        try:
+            waypoint_index = int(waypoint_choice) - 1
+            if 0 <= waypoint_index < len(rows):
+                _, name, x_value, z_value = rows[waypoint_index]
+                ACTIVE_WAYPOINT = {"name": name, "x": float(x_value), "z": float(z_value)}
+                break
+        except ValueError:
+            pass
+        print("[F6] 올바른 좌표 번호를 선택해 주세요.")
+
+    CURRENT_MODEL_NAME = selected_model
+    CURRENT_CONFIDENCE_THRESHOLD = confidence
+    START_CONFIG = (selected_model, confidence)
+    MODEL_READY = False
+    set_running(False)
+    print(f"[F6] 설정 완료: 모델={selected_model}, 유사도={confidence:.2f}, 좌표={ACTIVE_WAYPOINT['name']} / X={ACTIVE_WAYPOINT['x']} / Z={ACTIVE_WAYPOINT['z']}")
+    print("[F6] F7: 캘리브레이션 | F8: 감지 시작")
+    START_CONFIG_EVENT.set()
+
+
+def release_all_movement_keys():
+    for key in ('w', 'a', 's', 'd', 'ctrl', 'space'):
+        try:
+            pydirectinput.keyUp(key)
+        except Exception:
+            pass
+
+
+def calibrate_movement_keys():
+    """각 이동 키(w, a, s, d)가 좌표에 미치는 영향을 측정합니다."""
+    global MOVEMENT_CALIBRATION, CALIBRATION_READY
+    
+    print("[캘리브레이션] 이동 키 효과 측정 중...")
+    print("[캘리브레이션] 각 키를 눌러보고 좌표 변화를 확인합니다.")
+    
+    release_all_movement_keys()
+    time.sleep(0.5)
+    
+    base_hud = read_debug_hud_text_from_screen()
+    if not base_hud:
+        print("[캘리브레이션] HUD 텍스트를 읽을 수 없습니다.")
+        return False
+    
+    base_info = parse_debug_hud_text(base_hud)
+    if not base_info or base_info.get('x') is None or base_info.get('z') is None:
+        print("[캘리브레이션] 기준 좌표를 읽을 수 없습니다.")
+        return False
+    
+    base_x = base_info.get('x')
+    base_z = base_info.get('z')
+    print(f"[캘리브레이션] 기준 좌표: X={base_x}, Z={base_z}")
+    
+    for key in ['w', 'a', 's', 'd']:
+        time.sleep(0.3)
+        
+        pydirectinput.keyDown(key)
+        time.sleep(0.15)
+        pydirectinput.keyUp(key)
+        time.sleep(0.3)
+        
+        hud_text = read_debug_hud_text_from_screen()
+        if not hud_text:
+            print(f"[캘리브레이션] '{key}' 키: HUD 읽기 실패")
+            continue
+        
+        hud_info = parse_debug_hud_text(hud_text)
+        if not hud_info or hud_info.get('x') is None or hud_info.get('z') is None:
+            print(f"[캘리브레이션] '{key}' 키: 좌표 파싱 실패")
+            continue
+        
+        dx = hud_info.get('x') - base_x
+        dz = hud_info.get('z') - base_z
+        
+        MOVEMENT_CALIBRATION[key]['dx'] = round(dx, 1)
+        MOVEMENT_CALIBRATION[key]['dz'] = round(dz, 1)
+        
+        print(f"[캘리브레이션] '{key}' 키: X변화={dx:.1f}, Z변화={dz:.1f}")
+    
+    CALIBRATION_READY = True
+    print("[캘리브레이션] 완료!")
+    print(f"[캘리브레이션] 결과: {MOVEMENT_CALIBRATION}")
+    return True
+
+
+def apply_coordinate_waypoint_move():
+    global ACTIVE_WAYPOINT, CALIBRATION_READY
+
+    if ACTIVE_WAYPOINT is None or not get_running():
+        return
+
+    if not CALIBRATION_READY:
+        calibrate_movement_keys()
+        if not CALIBRATION_READY:
+            return
+
+    hud_text = read_debug_hud_text_from_screen()
+    if not hud_text:
+        return
+
+    hud_info = parse_debug_hud_text(hud_text)
+    if not hud_info:
+        return
+
+    current_x = hud_info.get('x')
+    current_z = hud_info.get('z')
+    if current_x is None or current_z is None:
+        return
+
+    target_x = ACTIVE_WAYPOINT['x']
+    target_z = ACTIVE_WAYPOINT['z']
+    tolerance = 1.0
+
+    release_all_movement_keys()
+    set_movement_combo(False)
+
+    dx = target_x - current_x
+    dz = target_z - current_z
+
+    if abs(dx) <= tolerance and abs(dz) <= tolerance:
+        print(f"[좌표 도달] {ACTIVE_WAYPOINT['name']} / 현재 X={current_x}, Z={current_z}")
+        ACTIVE_WAYPOINT = None
+        return
+
+    print(f"[이동] {ACTIVE_WAYPOINT['name']}로 이동 중 | 현재: X={current_x:.1f}, Z={current_z:.1f} | 목표: X={target_x}, Z={target_z}")
+
+    move_distance = ((dx ** 2) + (dz ** 2)) ** 0.5
+    print(f"[이동] 목표까지 거리: {move_distance:.1f}")
+
+    max_attempts = 20
+    for attempt in range(max_attempts):
+        if not get_running():
+            return
+
+        hud_text = read_debug_hud_text_from_screen()
+        if not hud_text:
+            continue
+
+        hud_info = parse_debug_hud_text(hud_text)
+        if not hud_info or hud_info.get('x') is None or hud_info.get('z') is None:
+            continue
+
+        current_x = hud_info.get('x')
+        current_z = hud_info.get('z')
+
+        dx = target_x - current_x
+        dz = target_z - current_z
+
+        if abs(dx) <= tolerance and abs(dz) <= tolerance:
+            print(f"[좌표 도달] {ACTIVE_WAYPOINT['name']} / 최종 X={current_x:.1f}, Z={current_z:.1f}")
+            ACTIVE_WAYPOINT = None
+            return
+
+        keys_to_press = []
+
+        if dx > tolerance:
+            keys_to_press.append('d')
+            if abs(MOVEMENT_CALIBRATION['d']['dx']) > 0:
+                presses = max(1, int(abs(dx) / max(abs(MOVEMENT_CALIBRATION['d']['dx']), 0.1)))
+                for _ in range(presses):
+                    pydirectinput.keyDown('d')
+                    time.sleep(0.1)
+                    pydirectinput.keyUp('d')
+                    time.sleep(0.1)
+                print(f"[이동] 'd' {presses}회 입력 (dx={dx:.1f})")
+        elif dx < -tolerance:
+            keys_to_press.append('a')
+            if abs(MOVEMENT_CALIBRATION['a']['dx']) > 0:
+                presses = max(1, int(abs(dx) / max(abs(MOVEMENT_CALIBRATION['a']['dx']), 0.1)))
+                for _ in range(presses):
+                    pydirectinput.keyDown('a')
+                    time.sleep(0.1)
+                    pydirectinput.keyUp('a')
+                    time.sleep(0.1)
+                print(f"[이동] 'a' {presses}회 입력 (dx={dx:.1f})")
+
+        if dz > tolerance:
+            keys_to_press.append('w')
+            if abs(MOVEMENT_CALIBRATION['w']['dz']) > 0:
+                presses = max(1, int(abs(dz) / max(abs(MOVEMENT_CALIBRATION['w']['dz']), 0.1)))
+                for _ in range(presses):
+                    pydirectinput.keyDown('w')
+                    time.sleep(0.1)
+                    pydirectinput.keyUp('w')
+                    time.sleep(0.1)
+                print(f"[이동] 'w' {presses}회 입력 (dz={dz:.1f})")
+        elif dz < -tolerance:
+            keys_to_press.append('s')
+            if abs(MOVEMENT_CALIBRATION['s']['dz']) > 0:
+                presses = max(1, int(abs(dz) / max(abs(MOVEMENT_CALIBRATION['s']['dz']), 0.1)))
+                for _ in range(presses):
+                    pydirectinput.keyDown('s')
+                    time.sleep(0.1)
+                    pydirectinput.keyUp('s')
+                    time.sleep(0.1)
+                print(f"[이동] 's' {presses}회 입력 (dz={dz:.1f})")
+
+        time.sleep(0.2)
+
+
 def on_press(key):
-    global HUD_CHECK_TRIGGER
+    global HUD_CHECK_TRIGGER, CALIBRATION_READY
     try:
-        if key == keyboard.Key.f8:
+        if key == keyboard.Key.f5:
+            prompt_add_waypoint()
+        elif key == keyboard.Key.f6:
+            prompt_select_run_config()
+        elif key == keyboard.Key.f7:
+            print("[F7] 캘리브레이션 시작...")
+            set_running(False)
+            CALIBRATION_READY = False
+            calibrate_movement_keys()
+        elif key == keyboard.Key.f8:
+            if START_CONFIG is None:
+                print("[F8] 먼저 F6으로 모델/유사도/좌표를 선택해 주세요.")
+                return
             set_running(True)
             print("[F8] 자동 사냥 시작")
             HUD_CHECK_TRIGGER = True
         elif key == keyboard.Key.f9:
             set_running(False)
             print("[F9] 자동 사냥 정지")
+            release_all_movement_keys()
     except AttributeError:
         pass
 
@@ -594,12 +951,32 @@ def attack_target_until_dead(model, confidence_threshold):
 
 
 def main():
-    global W_KEY_ACTIVE, HUD_CHECK_TRIGGER, OCR_SCAN_ACTIVE, SEARCH_BOOST_UNTIL
+    global W_KEY_ACTIVE, HUD_CHECK_TRIGGER, OCR_SCAN_ACTIVE, SEARCH_BOOST_UNTIL, START_CONFIG, MODEL_READY
     print("YOLO 몹 감지 자동 사냥 시작")
-    print("F8: 시작 | F9: 정지 | Ctrl + C: 종료")
+    print("F5: 좌표 추가 | F6: 모델/유사도/좌표 선택 | F7: 캘리브레이션 | F8: 시작 | F9: 정지 | Ctrl + C: 종료")
 
     selected_model, confidence_threshold = parse_cli_args()
+    global CURRENT_MODEL_NAME, CURRENT_CONFIDENCE_THRESHOLD
+    if selected_model is not None:
+        CURRENT_MODEL_NAME = selected_model
+        CURRENT_CONFIDENCE_THRESHOLD = confidence_threshold
+        START_CONFIG = (selected_model, confidence_threshold)
 
+    if confidence_threshold < 0.0:
+        confidence_threshold = 0.0
+    if confidence_threshold > 1.0:
+        confidence_threshold = 1.0
+
+    init_waypoints_db()
+    print("대기 중... F5 또는 F6을 눌러 설정을 완료하세요")
+
+    listener_thread = threading.Thread(target=keyboard_listener, daemon=True)
+    listener_thread.start()
+
+    START_CONFIG_EVENT.clear()
+    START_CONFIG_EVENT.wait()
+
+    selected_model, confidence_threshold = START_CONFIG
     if confidence_threshold < 0.0:
         confidence_threshold = 0.0
     if confidence_threshold > 1.0:
@@ -612,14 +989,15 @@ def main():
     print(f"모델 로드 중: {model_path}")
     print(f"신뢰도 임계치: {confidence_threshold:.2f}")
     model = YOLO(str(model_path))
+    MODEL_READY = True
     print("모델 로드 완료")
     print(f"HUD OCR 준비 상태: {ensure_ocr_ready()}")
     if pytesseract is not None and hasattr(pytesseract, 'pytesseract'):
         print(f"Tesseract 경로: {pytesseract.pytesseract.tesseract_cmd}")
-    print("대기 중... F8을 눌러 시작하세요")
+    print("모델 준비 완료. F8을 눌러 감지를 시작하세요")
 
-    listener_thread = threading.Thread(target=keyboard_listener, daemon=True)
-    listener_thread.start()
+    set_running(False)
+    release_all_movement_keys()
 
     last_process_time = 0
     last_click_time = 0.0
@@ -633,12 +1011,13 @@ def main():
     try:
         while True:
             if not get_running():
-                time.sleep(0.05)
+                gc.collect()
+                time.sleep(0.1)
                 continue
 
             now = time.perf_counter()
-            if now - last_process_time < 0.003:
-                time.sleep(0.0015)
+            if now - last_process_time < 0.005:
+                time.sleep(0.002)
                 continue
 
             if SEARCH_BOOST_ACTIVE and time.monotonic() >= SEARCH_BOOST_UNTIL:
@@ -653,6 +1032,8 @@ def main():
             last_process_time = now
             frame = capture_screen()
             detections = detect_mobs(frame, model)
+            del frame
+            gc.collect()
 
             if detections:
                 filtered = [d for d in detections if d[2] >= confidence_threshold]
@@ -714,6 +1095,9 @@ def main():
                     if not OCR_SCAN_ACTIVE:
                         print("무감지 5초 경과: OCR 스캔 + 마우스 보정 시작")
                     OCR_SCAN_ACTIVE = True
+
+                if ACTIVE_WAYPOINT is not None:
+                    apply_coordinate_waypoint_move()
 
             time.sleep(0.01)
 
