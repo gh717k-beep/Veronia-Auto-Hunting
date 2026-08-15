@@ -23,12 +23,17 @@ pydirectinput.PAUSE = 0.001
 FRAME_SCALE = 0.8
 MAX_PROCESS_FPS = 80
 MIN_INTERVAL_SEC = 1.0 / MAX_PROCESS_FPS
-MOVE_SMOOTHING = 2.4
+MOVE_SMOOTHING = 1.2
 CLICK_RATE_PER_SEC = 8.0
 CLICK_INTERVAL_SEC = 1.0 / CLICK_RATE_PER_SEC
 FAR_ATTACK_DISTANCE_BOX_H = 170
 NEAR_ATTACK_DISTANCE_BOX_H = 260
-AIM_DEADZONE = 25
+AIM_DEADZONE = 50
+MAX_MOVE_PER_FRAME = None  # 제한 없음, 방향으로 직접 이동
+MAX_Y_OFFSET_FROM_START = 200  # 프로그램 시작 시 Y축 이동 가능 마지노선
+SCAN_RIGHT_STEP = 18
+SCAN_DOWN_STEP = 18
+SCAN_UP_STEP = 18
 W_KEY_ACTIVE = False
 
 ROOT = Path(__file__).resolve().parent
@@ -189,8 +194,8 @@ def get_closest_mob(detections):
     return closest
 
 
-def move_mouse_relative_to_center(target_x, target_y):
-    """화면의 정중앙 기준으로 타깃의 상대 위치만큼 마우스를 상대 이동시킵니다."""
+def move_mouse_relative_to_center(target_x, target_y, fast=False):
+    """타깃 방향으로 이동. 감지 시 fast=True면 빠르게, 아니면 가볍게."""
     screen_width, screen_height = pyautogui.size()
     center_x = screen_width / 2
     center_y = screen_height / 2
@@ -198,9 +203,15 @@ def move_mouse_relative_to_center(target_x, target_y):
     dx = target_x - center_x
     dy = target_y - center_y
 
-    # 좌우/상하 이동만큼만 상대 이동을 줘서 게임 화면을 회전시킵니다.
-    move_x = int(dx * MOVE_SMOOTHING)
-    move_y = int(dy * MOVE_SMOOTHING)
+    if abs(dx) < AIM_DEADZONE and abs(dy) < AIM_DEADZONE:
+        return 0, 0
+
+    if fast:
+        move_x = int(dx * 0.9)
+        move_y = int(dy * 0.9)
+    else:
+        move_x = int(dx * MOVE_SMOOTHING * 0.35)
+        move_y = int(dy * MOVE_SMOOTHING * 0.35)
 
     if abs(move_x) > 0 or abs(move_y) > 0:
         pydirectinput.moveRel(move_x, move_y, relative=True)
@@ -266,12 +277,30 @@ def ensure_hp_ui_visible():
     return parse_hp_text(read_hp_text_from_screen())
 
 
+def set_movement_combo(active):
+    """이동 키를 Ctrl + W + Space 조합으로 활성/비활성화한다."""
+    global W_KEY_ACTIVE
+
+    if active and not W_KEY_ACTIVE:
+        pydirectinput.keyDown('ctrl')
+        pydirectinput.keyDown('w')
+        pydirectinput.keyDown('space')
+        W_KEY_ACTIVE = True
+        pass
+    elif not active and W_KEY_ACTIVE:
+        pydirectinput.keyUp('space')
+        pydirectinput.keyUp('w')
+        pydirectinput.keyUp('ctrl')
+        W_KEY_ACTIVE = False
+        pass
+
+
 def press_w_key_hold(duration_sec=0.08):
-    """짧게 W 키를 눌러 게임이 실제 입력을 인식하도록 보장한다."""
-    print(f"W 키 누름: {duration_sec:.2f}초")
-    pydirectinput.keyDown('w')
+    """짧게 이동 조합 키를 눌러 게임이 실제 입력을 인식하도록 보장한다."""
+    pass
+    set_movement_combo(True)
     time.sleep(duration_sec)
-    pydirectinput.keyUp('w')
+    set_movement_combo(False)
 
 
 def send_attack_clicks():
@@ -295,7 +324,6 @@ def attack_target_until_dead(model, confidence_threshold):
                 hp_info = ensure_hp_ui_visible()
 
             if hp_info is not None and hp_info.get('current', 1) == 0:
-                print("HP 0 감지: 공격 종료")
                 return
 
             frame = capture_screen()
@@ -315,13 +343,11 @@ def attack_target_until_dead(model, confidence_threshold):
 
                 if box_h < 170:
                     if not W_KEY_ACTIVE:
-                        pydirectinput.keyDown('w')
-                        W_KEY_ACTIVE = True
-                        print(f"거리 멀음: box_h={box_h:.0f} -> W 지속 전진")
+                        set_movement_combo(True)
+                        print(f"거리 멀음: box_h={box_h:.0f} -> Ctrl + W + Space 지속 전진")
                 elif box_h > NEAR_ATTACK_DISTANCE_BOX_H:
                     if W_KEY_ACTIVE:
-                        pydirectinput.keyUp('w')
-                        W_KEY_ACTIVE = False
+                        set_movement_combo(False)
                     if abs(dx) < AIM_DEADZONE:
                         now = time.monotonic()
                         if now - last_click_time >= CLICK_INTERVAL_SEC:
@@ -329,12 +355,10 @@ def attack_target_until_dead(model, confidence_threshold):
                             last_click_time = now
                 else:
                     if W_KEY_ACTIVE:
-                        pydirectinput.keyUp('w')
-                        W_KEY_ACTIVE = False
+                        set_movement_combo(False)
             else:
                 if W_KEY_ACTIVE:
-                    pydirectinput.keyUp('w')
-                    W_KEY_ACTIVE = False
+                    set_movement_combo(False)
                 if last_target is not None:
                     x_center, y_center, conf = last_target[:3]
                     move_mouse_relative_to_center(x_center, y_center)
@@ -342,8 +366,7 @@ def attack_target_until_dead(model, confidence_threshold):
             time.sleep(0.01)
     finally:
         if W_KEY_ACTIVE:
-            pydirectinput.keyUp('w')
-            W_KEY_ACTIVE = False
+            set_movement_combo(False)
 
 
 def main():
@@ -372,6 +395,10 @@ def main():
 
     last_process_time = 0
     last_click_time = 0.0
+    last_detection_time = time.monotonic()
+    start_mouse_x, start_mouse_y = pyautogui.position()
+    max_y_lower_bound = start_mouse_y - MAX_Y_OFFSET_FROM_START
+    scan_mode = "top_right"
 
     try:
         while True:
@@ -391,24 +418,26 @@ def main():
             if detections:
                 filtered = [d for d in detections if d[2] >= confidence_threshold]
                 if not filtered:
+                    if W_KEY_ACTIVE:
+                        set_movement_combo(False)
                     time.sleep(0.02)
                     continue
 
+                last_detection_time = time.monotonic()
                 mob = get_closest_mob(filtered)
                 x_center, y_center, conf, box_h = mob
-                move_x, move_y = move_mouse_relative_to_center(x_center, y_center)
-                print(f"몹 감지: ({x_center:.0f}, {y_center:.0f}) 신뢰도: {conf:.2f} | 박스높이: {box_h:.0f} | 상대 이동: ({move_x}, {move_y})")
+                move_mouse_relative_to_center(x_center, y_center, fast=True)
+                print(f"감지 size={box_h:.0f}")
 
                 # 거리 기반 W 키 제어
                 if box_h < 170:
                     if not W_KEY_ACTIVE:
-                        pydirectinput.keyDown('w')
-                        W_KEY_ACTIVE = True
-                        print(f"거리 멀음: box_h={box_h:.0f} -> W 지속 전진")
+                        set_movement_combo(True)
+                        print(f"거리 멀음: box_h={box_h:.0f} -> Ctrl + W + Space 지속 전진")
                 else:
                     if W_KEY_ACTIVE:
-                        pydirectinput.keyUp('w')
-                        W_KEY_ACTIVE = False
+                        set_movement_combo(False)
+                        print(f"거리 적정: box_h={box_h:.0f} -> 이동 정지")
 
                 now_click = time.monotonic()
                 if now_click - last_click_time >= CLICK_INTERVAL_SEC:
@@ -424,13 +453,29 @@ def main():
                     continue
 
                 if hp_info is not None and hp_info.get('current', 1) == 0:
-                    print("현재 HP 0: 전투 종료")
                     set_running(False)
+            else:
+                if W_KEY_ACTIVE:
+                    set_movement_combo(False)
+
+                now_no_detection = time.monotonic()
+                if now_no_detection - last_detection_time >= 10.0:
+                    if scan_mode == "top_right":
+                        scan_mode = "bottom_right"
+                    else:
+                        scan_mode = "top_right"
+                    last_detection_time = now_no_detection
+                    print("무감지 10초 경과: 우측 상단/하단 탐색 시작")
+
+                if scan_mode == "top_right":
+                    pydirectinput.moveRel(SCAN_RIGHT_STEP, -SCAN_UP_STEP, relative=True)
+                else:
+                    pydirectinput.moveRel(SCAN_RIGHT_STEP, SCAN_DOWN_STEP, relative=True)
 
             time.sleep(0.01)
 
     except KeyboardInterrupt:
-        print("\n프로그램 종료")
+        pass
 
 
 if __name__ == "__main__":
