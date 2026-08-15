@@ -31,7 +31,7 @@ echo.
 set /p MODEL_INPUT=모델 번호 또는 이름 입력 (엔터: 최신 모델 자동 선택): 
 set /p CONFIDENCE=감지 신뢰도 입력 (0.0 ~ 1.0, 예: 0.55): 
 
-if "%CONFIDENCE%"=="" set "CONFIDENCE=0.55"
+if "%CONFIDENCE%"=="" set "CONFIDENCE=0.7"
 set "MODEL_NAME="
 if not "%MODEL_INPUT%"=="" (
     set "MODEL_NAME=%MODEL_INPUT%"
