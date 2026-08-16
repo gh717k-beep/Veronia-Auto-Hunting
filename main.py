@@ -1,5 +1,6 @@
 import ctypes
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -35,8 +36,11 @@ EXIT_REQUESTED = False
 TARGET_ACTION_SIZE = 37000
 CLICK_INTERVAL_SECONDS = 0.12
 FRAME_INTERVAL_SECONDS = 0.08
+AUTO_HEAL_INTERVAL_SECONDS = 35.0
+AUTO_HEAL_RIGHT_CLICK_GAP_SECONDS = 0.3
 LAST_CLICK_TIME = 0.0
 LAST_DETECTION_TIME = 0.0
+AUTO_HEAL_MACRO_LAST_RUN = 0.0
 DETECTION_LOG_COUNTER = 0
 W_KEY_PRESSED = False
 USER_W_PRESSED = False
@@ -141,6 +145,33 @@ def click_left_mouse() -> None:
         ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
 
 
+def click_right_mouse() -> None:
+    if win32api and win32con:
+        win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0)
+        win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0)
+    else:
+        ctypes.windll.user32.mouse_event(0x0008, 0, 0, 0, 0)
+        ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0)
+
+
+def run_auto_heal_macro() -> None:
+    global AUTO_HEAL_MACRO_LAST_RUN
+    AUTO_HEAL_MACRO_LAST_RUN = time.monotonic()
+
+    print("[자동 힐] 1번 → 우클릭 → 5초 대기 → 2번 → 우클릭 x3 → 3번")
+
+    KEYBOARD_CONTROLLER.tap('1')
+    click_right_mouse()
+    time.sleep(5.0)
+
+    KEYBOARD_CONTROLLER.tap('2')
+    for _ in range(3):
+        click_right_mouse()
+        time.sleep(AUTO_HEAL_RIGHT_CLICK_GAP_SECONDS)
+
+    KEYBOARD_CONTROLLER.tap('3')
+
+
 def set_s_key_state(should_press: bool) -> None:
     global S_KEY_PRESSED
     if should_press and not S_KEY_PRESSED:
@@ -158,8 +189,10 @@ def set_s_key_state(should_press: bool) -> None:
 
 
 def toggle_detection():
-    global ACTIVE_DETECTION
+    global ACTIVE_DETECTION, AUTO_HEAL_MACRO_LAST_RUN
     ACTIVE_DETECTION = not ACTIVE_DETECTION
+    if ACTIVE_DETECTION:
+        AUTO_HEAL_MACRO_LAST_RUN = time.monotonic()
     status = "활성화" if ACTIVE_DETECTION else "비활성화"
     print(f"[F8] 탐지 {status}")
 
@@ -361,6 +394,10 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
                 continue
 
             now = time.monotonic()
+            if now - AUTO_HEAL_MACRO_LAST_RUN >= AUTO_HEAL_INTERVAL_SECONDS:
+                macro_thread = threading.Thread(target=run_auto_heal_macro, daemon=True)
+                macro_thread.start()
+
             if now - LAST_DETECTION_TIME < FRAME_INTERVAL_SECONDS:
                 time.sleep(0.01)
                 continue
@@ -398,8 +435,6 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
                 move_mouse(mouse_move_x, mouse_move_y)
 
                 DETECTION_LOG_COUNTER += 1
-                if DETECTION_LOG_COUNTER % 6 == 0:
-                    print(f"[검지] area={target['area']:.1f}, cx={target['cx']:.1f}, cy={target['cy']:.1f}")
 
                 if is_target_offset and target["area"] <= TARGET_ACTION_SIZE:
                     set_s_key_state(False)
@@ -430,16 +465,16 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
                     force_release_w_key()
                     now_dive = time.monotonic()
                     elapsed = now_dive - dive_phase_start
-                    phase_duration = 2.0
+                    phase_duration = 6.0
 
                     if elapsed >= phase_duration:
                         dive_phase_start = now_dive
                         dive_phase_up = not dive_phase_up
 
                     if dive_phase_up:
-                        move_mouse(30, -80)
+                        move_mouse(10, -28)
                     else:
-                        move_mouse(30, 80)
+                        move_mouse(10, 28)
                     continue
 
                 force_release_w_key()
