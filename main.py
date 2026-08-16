@@ -1,4 +1,5 @@
 import ctypes
+import re
 import time
 from pathlib import Path
 
@@ -8,6 +9,11 @@ import numpy as np
 import torch
 from pynput import keyboard
 from ultralytics import YOLO
+
+try:
+    import easyocr
+except ImportError:
+    easyocr = None
 
 try:
     import win32api
@@ -36,6 +42,12 @@ W_KEY_PRESSED = False
 USER_W_PRESSED = False
 KEYBOARD_CONTROLLER = keyboard.Controller()
 SCREEN_CAPTURE = mss.mss()
+OCR_READER = None
+DIVE_MODE_ACTIVE = False
+DIVE_MODE_STARTED_AT = 0.0
+LAST_TARGET_TIME = 0.0
+LAST_PITCH_OCR_TIME = 0.0
+LAST_PITCH_VALUE = 0
 
 
 def detect_device():
@@ -229,6 +241,28 @@ def capture_screen() -> np.ndarray:
     return np.ascontiguousarray(image)
 
 
+def get_ocr_reader():
+    global OCR_READER
+    if OCR_READER is not None:
+        return OCR_READER
+    if easyocr is None:
+        print("[OCR] easyocr가 설치되지 않아 Pitch OCR을 비활성화합니다.")
+        OCR_READER = False
+        return False
+    try:
+        OCR_READER = easyocr.Reader(['en'], gpu=YOLO_DEVICE != 'cpu')
+        print("[OCR] Pitch OCR 초기화 완료")
+        return OCR_READER
+    except Exception as exc:
+        print(f"[OCR] OCR 초기화 실패: {exc}")
+        OCR_READER = False
+        return False
+
+
+def read_pitch_value(frame: np.ndarray):
+    return LAST_PITCH_VALUE
+
+
 def select_main_target(detections: list[dict], threshold: float):
     candidates = [d for d in detections if d["confidence"] >= threshold]
     if not candidates:
@@ -265,6 +299,7 @@ def iterate_targets(results) -> list[dict]:
 
 def run_detection_loop(model_path: Path, threshold: float) -> None:
     global ACTIVE_DETECTION, EXIT_REQUESTED, LAST_DETECTION_TIME, DETECTION_LOG_COUNTER
+    global DIVE_MODE_ACTIVE, DIVE_MODE_STARTED_AT, LAST_TARGET_TIME, LAST_PITCH_OCR_TIME, LAST_PITCH_VALUE
 
     print("========================================")
     print("State 1: 전투 및 고정밀 관성 추적 (Combat & Velocity Tracking Mode)")
@@ -296,10 +331,14 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
     last_vy = 0.0
     missed_frames = 0
     frame_counter = 0
+    LAST_TARGET_TIME = time.monotonic()
+    dive_phase_start = time.monotonic()
+    dive_phase_up = True
 
     try:
         while not EXIT_REQUESTED:
             if not ACTIVE_DETECTION:
+                DIVE_MODE_ACTIVE = False
                 force_release_w_key()
                 time.sleep(0.02)
                 continue
@@ -326,6 +365,8 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
                 target = select_main_target(detections, threshold)
 
             if target is not None:
+                LAST_TARGET_TIME = time.monotonic()
+                DIVE_MODE_ACTIVE = False
                 missed_frames = 0
                 dx = target["cx"] - SCREEN_CENTER_X
                 dy = target["cy"] - SCREEN_CENTER_Y
@@ -356,6 +397,28 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
                 last_vy = dy
             else:
                 missed_frames += 1
+                if (time.monotonic() - LAST_TARGET_TIME) >= 1.0:
+                    if not DIVE_MODE_ACTIVE:
+                        DIVE_MODE_ACTIVE = True
+                        DIVE_MODE_STARTED_AT = time.monotonic()
+                        dive_phase_start = time.monotonic()
+                        dive_phase_up = True
+
+                    force_release_w_key()
+                    now_dive = time.monotonic()
+                    elapsed = now_dive - dive_phase_start
+                    phase_duration = 2.0
+
+                    if elapsed >= phase_duration:
+                        dive_phase_start = now_dive
+                        dive_phase_up = not dive_phase_up
+
+                    if dive_phase_up:
+                        move_mouse(30, -80)
+                    else:
+                        move_mouse(30, 80)
+                    continue
+
                 force_release_w_key()
                 if missed_frames <= MAX_MISSED_FRAMES:
                     predicted_dx = int(last_vx * 0.9)
