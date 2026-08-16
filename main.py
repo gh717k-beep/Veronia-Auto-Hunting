@@ -1,4 +1,5 @@
 import ctypes
+import gc
 import re
 import threading
 import time
@@ -38,15 +39,25 @@ CLICK_INTERVAL_SECONDS = 0.12
 FRAME_INTERVAL_SECONDS = 0.08
 AUTO_HEAL_INTERVAL_SECONDS = 35.0
 AUTO_HEAL_RIGHT_CLICK_GAP_SECONDS = 0.3
+AUTO_REPAIR_INTERVAL_SECONDS = 160.0
 LAST_CLICK_TIME = 0.0
 LAST_DETECTION_TIME = 0.0
 AUTO_HEAL_MACRO_LAST_RUN = 0.0
+AUTO_REPAIR_MACRO_LAST_RUN = 0.0
 DETECTION_LOG_COUNTER = 0
+
+# 키보드 입력 및 매크로 상태 관리
 W_KEY_PRESSED = False
 USER_W_PRESSED = False
 S_KEY_PRESSED = False
+SHIFT_KEY_PRESSED = False
+IS_HEALING_MACRO_RUNNING = False   # 힐 매크로 플래그
+IS_REPAIRING_MACRO_RUNNING = False # 수리 매크로 플래그
 KEYBOARD_CONTROLLER = keyboard.Controller()
-SCREEN_CAPTURE = mss.mss()
+
+SCREEN_CAPTURE = None
+MONITOR_BOUNDS = None
+
 OCR_READER = None
 DIVE_MODE_ACTIVE = False
 DIVE_MODE_STARTED_AT = 0.0
@@ -56,7 +67,6 @@ LAST_PITCH_VALUE = 0
 
 
 def detect_device():
-    """CUDA 호환성을 검사하고 사용 가능한 장치를 반환"""
     if not torch.cuda.is_available():
         print("[장치] CUDA를 사용할 수 없습니다. CPU 모드로 실행합니다.")
         return 'cpu'
@@ -73,6 +83,14 @@ def detect_device():
 
 
 YOLO_DEVICE = detect_device()
+
+
+def get_ocr_reader():
+    global OCR_READER
+    if OCR_READER is None and easyocr is not None:
+        use_gpu = True if YOLO_DEVICE != 'cpu' else False
+        OCR_READER = easyocr.Reader(['en'], gpu=use_gpu)
+    return OCR_READER
 
 
 def on_w_key_down(key):
@@ -94,7 +112,10 @@ def on_w_key_up(key):
 
 
 def set_w_key_state(should_press: bool) -> None:
-    global W_KEY_PRESSED, USER_W_PRESSED
+    global W_KEY_PRESSED, USER_W_PRESSED, IS_REPAIRING_MACRO_RUNNING
+    if IS_REPAIRING_MACRO_RUNNING:
+        should_press = False
+
     effective_should_press = should_press or USER_W_PRESSED
     
     if effective_should_press and not W_KEY_PRESSED:
@@ -120,12 +141,49 @@ def release_w_key() -> None:
 
 
 def force_release_w_key() -> None:
-    """사용자 입력 무시하고 W를 강제 해제 (큰 타겟에서 클릭 모드로 전환)"""
     global W_KEY_PRESSED
     if W_KEY_PRESSED:
         try:
             KEYBOARD_CONTROLLER.release('w')
             W_KEY_PRESSED = False
+        except Exception:
+            pass
+
+
+def set_s_key_state(should_press: bool) -> None:
+    global S_KEY_PRESSED, IS_REPAIRING_MACRO_RUNNING
+    if IS_REPAIRING_MACRO_RUNNING:
+        should_press = False
+
+    if should_press and not S_KEY_PRESSED:
+        try:
+            KEYBOARD_CONTROLLER.press('s')
+            S_KEY_PRESSED = True
+        except Exception:
+            pass
+    elif not should_press and S_KEY_PRESSED:
+        try:
+            KEYBOARD_CONTROLLER.release('s')
+            S_KEY_PRESSED = False
+        except Exception:
+            pass
+
+
+def set_shift_key_state(should_press: bool) -> None:
+    global SHIFT_KEY_PRESSED, IS_HEALING_MACRO_RUNNING, IS_REPAIRING_MACRO_RUNNING
+    if IS_HEALING_MACRO_RUNNING or IS_REPAIRING_MACRO_RUNNING:
+        should_press = False
+
+    if should_press and not SHIFT_KEY_PRESSED:
+        try:
+            KEYBOARD_CONTROLLER.press(keyboard.Key.shift)
+            SHIFT_KEY_PRESSED = True
+        except Exception:
+            pass
+    elif not should_press and SHIFT_KEY_PRESSED:
+        try:
+            KEYBOARD_CONTROLLER.release(keyboard.Key.shift)
+            SHIFT_KEY_PRESSED = False
         except Exception:
             pass
 
@@ -154,45 +212,65 @@ def click_right_mouse() -> None:
         ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0)
 
 
+def stop_all_actions() -> None:
+    """모든 조작 키 입력 해제 함수"""
+    force_release_w_key()
+    set_s_key_state(False)
+    set_shift_key_state(False)
+
+
 def run_auto_heal_macro() -> None:
-    global AUTO_HEAL_MACRO_LAST_RUN
+    global AUTO_HEAL_MACRO_LAST_RUN, IS_HEALING_MACRO_RUNNING
     AUTO_HEAL_MACRO_LAST_RUN = time.monotonic()
+    IS_HEALING_MACRO_RUNNING = True
 
-    print("[자동 힐] 1번 → 우클릭 → 5초 대기 → 2번 → 우클릭 x3 → 3번")
+    set_shift_key_state(False)
+    print("[자동 힐] 1번 → 우클릭 → 5초 대기 → 2번 → 우클릭 x3 → 3번 (Shift 차단)")
 
-    KEYBOARD_CONTROLLER.tap('1')
-    click_right_mouse()
-    time.sleep(5.0)
-
-    KEYBOARD_CONTROLLER.tap('2')
-    for _ in range(3):
+    try:
+        KEYBOARD_CONTROLLER.tap('1')
         click_right_mouse()
-        time.sleep(AUTO_HEAL_RIGHT_CLICK_GAP_SECONDS)
+        time.sleep(5.0)
 
-    KEYBOARD_CONTROLLER.tap('3')
+        KEYBOARD_CONTROLLER.tap('2')
+        for _ in range(3):
+            click_right_mouse()
+            time.sleep(AUTO_HEAL_RIGHT_CLICK_GAP_SECONDS)
+
+        KEYBOARD_CONTROLLER.tap('3')
+    finally:
+        IS_HEALING_MACRO_RUNNING = False
 
 
-def set_s_key_state(should_press: bool) -> None:
-    global S_KEY_PRESSED
-    if should_press and not S_KEY_PRESSED:
-        try:
-            KEYBOARD_CONTROLLER.press('s')
-            S_KEY_PRESSED = True
-        except Exception:
-            pass
-    elif not should_press and S_KEY_PRESSED:
-        try:
-            KEYBOARD_CONTROLLER.release('s')
-            S_KEY_PRESSED = False
-        except Exception:
-            pass
+def run_auto_repair_macro() -> None:
+    """수리 매크로: 하던 모든 행동을 정지하고 9번 -> 0.5s -> 우클릭 -> 1s -> 3번 순서로 수행"""
+    global AUTO_REPAIR_MACRO_LAST_RUN, IS_REPAIRING_MACRO_RUNNING
+    AUTO_REPAIR_MACRO_LAST_RUN = time.monotonic()
+    IS_REPAIRING_MACRO_RUNNING = True
+
+    # 현재 입력 중인 이동/조작 키 즉시 정지
+    stop_all_actions()
+
+    print("[자동 수리] 모든 동작 정지 ➔ 9번 ➔ (0.5초) ➔ 우클릭 ➔ (1초) ➔ 3번")
+
+    try:
+        KEYBOARD_CONTROLLER.tap('9')
+        time.sleep(0.5)
+
+        click_right_mouse()
+        time.sleep(1.0)
+
+        KEYBOARD_CONTROLLER.tap('3')
+    finally:
+        IS_REPAIRING_MACRO_RUNNING = False
 
 
 def toggle_detection():
-    global ACTIVE_DETECTION, AUTO_HEAL_MACRO_LAST_RUN
+    global ACTIVE_DETECTION, AUTO_HEAL_MACRO_LAST_RUN, AUTO_REPAIR_MACRO_LAST_RUN
     ACTIVE_DETECTION = not ACTIVE_DETECTION
     if ACTIVE_DETECTION:
         AUTO_HEAL_MACRO_LAST_RUN = time.monotonic()
+        AUTO_REPAIR_MACRO_LAST_RUN = time.monotonic()
     status = "활성화" if ACTIVE_DETECTION else "비활성화"
     print(f"[F8] 탐지 {status}")
 
@@ -201,16 +279,6 @@ def request_exit():
     global EXIT_REQUESTED
     EXIT_REQUESTED = True
     print("[F9] 종료 요청")
-
-
-def on_key_press(key):
-    try:
-        if key == keyboard.Key.f8:
-            toggle_detection()
-        elif key == keyboard.Key.f9:
-            request_exit()
-    except AttributeError:
-        pass
 
 
 def list_model_paths() -> list[Path]:
@@ -285,32 +353,49 @@ def move_mouse(delta_x: int, delta_y: int) -> None:
 
 
 def capture_screen() -> np.ndarray:
-    monitor = SCREEN_CAPTURE.monitors[1]
-    shot = np.ascontiguousarray(np.array(SCREEN_CAPTURE.grab(monitor), dtype=np.uint8))
-    image = cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
-    return np.ascontiguousarray(image)
+    global SCREEN_CAPTURE, MONITOR_BOUNDS
+    if SCREEN_CAPTURE is None:
+        SCREEN_CAPTURE = mss.mss()
+        MONITOR_BOUNDS = SCREEN_CAPTURE.monitors[1]
+    
+    shot = np.array(SCREEN_CAPTURE.grab(MONITOR_BOUNDS), dtype=np.uint8)
+    return shot[:, :, :3]
 
 
-def get_ocr_reader():
-    global OCR_READER
-    if OCR_READER is not None:
-        return OCR_READER
-    if easyocr is None:
-        print("[OCR] easyocr가 설치되지 않아 Pitch OCR을 비활성화합니다.")
-        OCR_READER = False
-        return False
-    try:
-        OCR_READER = easyocr.Reader(['en'], gpu=YOLO_DEVICE != 'cpu')
-        print("[OCR] Pitch OCR 초기화 완료")
-        return OCR_READER
-    except Exception as exc:
-        print(f"[OCR] OCR 초기화 실패: {exc}")
-        OCR_READER = False
-        return False
+def read_pitch_from_screen(frame: np.ndarray) -> int | None:
+    reader = get_ocr_reader()
+    if reader is None:
+        return None
 
+    pitch_roi = frame[220:300, 0:300]
+    if pitch_roi.size == 0:
+        return None
 
-def read_pitch_value(frame: np.ndarray):
-    return LAST_PITCH_VALUE
+    gray = cv2.cvtColor(pitch_roi, cv2.COLOR_BGR2GRAY)
+    resized = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    _, thresh = cv2.threshold(resized, 170, 255, cv2.THRESH_BINARY)
+
+    results = reader.readtext(thresh, detail=0, allowlist='Pitch:0123456789- (negativeY)')
+
+    del pitch_roi, gray, resized, thresh
+
+    if not results:
+        print("[OCR 로그] 텍스트 인식 실패 (ROI 영역 내 글자를 감지하지 못함)")
+        return None
+
+    for text in results:
+        print(f"[OCR 텍스트 감지] 원본 텍스트: '{text}'")
+        match = re.search(r'Pitch:\s*(-?\d+)', text, re.IGNORECASE)
+        if match:
+            try:
+                val = int(match.group(1))
+                print(f"  └─► [Pitch 파싱 성공] 현재 인식된 Pitch 값: {val}")
+                return val
+            except ValueError:
+                pass
+
+    print("  └─► [파싱 실패] Pitch 패턴을 찾지 못했습니다.")
+    return None
 
 
 def select_main_target(detections: list[dict], threshold: float):
@@ -324,22 +409,21 @@ def iterate_targets(results) -> list[dict]:
     detections: list[dict] = []
 
     for result in results:
-        if result is None or result.boxes is None:
+        if result is None or result.boxes is None or len(result.boxes) == 0:
             continue
 
-        for box in result.boxes:
-            xyxy = box.xyxy[0].detach().cpu().numpy().astype(float)
-            x1, y1, x2, y2 = xyxy
-            conf = float(box.conf[0].detach().cpu().item())
-            width = max(0.0, x2 - x1)
-            height = max(0.0, y2 - y1)
+        boxes_data = result.boxes.data.cpu().numpy()
+        for box in boxes_data:
+            x1, y1, x2, y2, conf, cls_id = box[:6]
+            width = max(0.0, float(x2 - x1))
+            height = max(0.0, float(y2 - y1))
             area = width * height
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
+            cx = float(x1 + x2) / 2.0
+            cy = float(y1 + y2) / 2.0
 
             detections.append({
                 "area": area,
-                "confidence": conf,
+                "confidence": float(conf),
                 "cx": cx,
                 "cy": cy,
             })
@@ -350,15 +434,16 @@ def iterate_targets(results) -> list[dict]:
 def run_detection_loop(model_path: Path, threshold: float) -> None:
     global ACTIVE_DETECTION, EXIT_REQUESTED, LAST_DETECTION_TIME, DETECTION_LOG_COUNTER
     global DIVE_MODE_ACTIVE, DIVE_MODE_STARTED_AT, LAST_TARGET_TIME, LAST_PITCH_OCR_TIME, LAST_PITCH_VALUE
+    global IS_REPAIRING_MACRO_RUNNING
 
     print("========================================")
     print("State 1: 전투 및 고정밀 관성 추적 (Combat & Velocity Tracking Mode)")
     print("========================================")
     print(f"모델: {model_path}")
     print(f"유사도 역치: {threshold:.2f}")
-    print("- YOLOv8 + ByteTrack 기준으로 가장 큰 바운딩 박스를 메인 타겟으로 선택합니다.")
-    print("- F8: 탐지 활성화/비활성화")
-    print("- F9: 종료")
+
+    if YOLO_DEVICE != 'cpu':
+        torch.backends.cudnn.benchmark = True
 
     model = YOLO(str(model_path))
     if YOLO_DEVICE != 'cpu':
@@ -382,29 +467,39 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
     missed_frames = 0
     frame_counter = 0
     LAST_TARGET_TIME = time.monotonic()
-    dive_phase_start = time.monotonic()
-    dive_phase_up = True
 
     try:
         while not EXIT_REQUESTED:
             if not ACTIVE_DETECTION:
                 DIVE_MODE_ACTIVE = False
-                force_release_w_key()
+                stop_all_actions()
+                gc.collect()
+                if YOLO_DEVICE != 'cpu' and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 time.sleep(0.02)
                 continue
 
             now = time.monotonic()
             if now - AUTO_HEAL_MACRO_LAST_RUN >= AUTO_HEAL_INTERVAL_SECONDS:
-                macro_thread = threading.Thread(target=run_auto_heal_macro, daemon=True)
-                macro_thread.start()
+                threading.Thread(target=run_auto_heal_macro, daemon=True).start()
 
-            if now - LAST_DETECTION_TIME < FRAME_INTERVAL_SECONDS:
-                time.sleep(0.01)
+            if now - AUTO_REPAIR_MACRO_LAST_RUN >= AUTO_REPAIR_INTERVAL_SECONDS:
+                threading.Thread(target=run_auto_repair_macro, daemon=True).start()
+
+            # 자동 수리 수행 중에는 일반 조작 및 마우스 추적 완전 대기
+            if IS_REPAIRING_MACRO_RUNNING:
+                time.sleep(0.05)
                 continue
-            LAST_DETECTION_TIME = now
+
+            elapsed_time = now - LAST_DETECTION_TIME
+            if elapsed_time < FRAME_INTERVAL_SECONDS:
+                time.sleep(max(0.001, FRAME_INTERVAL_SECONDS - elapsed_time))
+                continue
+            LAST_DETECTION_TIME = time.monotonic()
+
+            frame = capture_screen()
 
             with torch.inference_mode():
-                frame = capture_screen()
                 results = model.predict(
                     frame,
                     conf=threshold,
@@ -412,7 +507,7 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
                     imgsz=640,
                     device=0 if YOLO_DEVICE != 'cpu' else 'cpu',
                     verbose=False,
-                    max_det=50,
+                    max_det=20,
                 )
 
                 detections = iterate_targets(results)
@@ -434,47 +529,55 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
 
                 move_mouse(mouse_move_x, mouse_move_y)
 
-                DETECTION_LOG_COUNTER += 1
-
                 if is_target_offset and target["area"] <= TARGET_ACTION_SIZE:
                     set_s_key_state(False)
+                    set_shift_key_state(False)
                     press_w_key()
                 else:
                     if target["area"] > TARGET_ACTION_SIZE:
-                        # 객체가 너무 커서 왼쪽 클릭 연타만으로는 맞지 않을 때,
-                        # 크기가 역치에 수렴할 때까지 S를 꾹 누른 상태를 유지한다.
                         set_s_key_state(True)
+                        set_shift_key_state(True)
                         force_release_w_key()
                         click_left_mouse()
                     else:
                         set_s_key_state(False)
+                        set_shift_key_state(False)
                         release_w_key()
 
                 last_vx = dx
                 last_vy = dy
             else:
                 set_s_key_state(False)
+                set_shift_key_state(False)
                 missed_frames += 1
-                if (time.monotonic() - LAST_TARGET_TIME) >= 1.0:
+
+                if (now - LAST_TARGET_TIME) >= 1.0:
                     if not DIVE_MODE_ACTIVE:
                         DIVE_MODE_ACTIVE = True
-                        DIVE_MODE_STARTED_AT = time.monotonic()
-                        dive_phase_start = time.monotonic()
-                        dive_phase_up = True
+                        DIVE_MODE_STARTED_AT = now
+                        print("\n[상태 전환] 타겟 상실 -> 잠수 모드(Dive Mode) 진입")
 
                     force_release_w_key()
-                    now_dive = time.monotonic()
-                    elapsed = now_dive - dive_phase_start
-                    phase_duration = 6.0
 
-                    if elapsed >= phase_duration:
-                        dive_phase_start = now_dive
-                        dive_phase_up = not dive_phase_up
+                    if now - LAST_PITCH_OCR_TIME >= 0.25:
+                        LAST_PITCH_OCR_TIME = now
+                        parsed_pitch = read_pitch_from_screen(frame)
+                        if parsed_pitch is not None:
+                            LAST_PITCH_VALUE = parsed_pitch
 
-                    if dive_phase_up:
-                        move_mouse(10, -28)
+                    mouse_dx = 10
+                    mouse_dy = 0
+
+                    if LAST_PITCH_VALUE > 0:
+                        mouse_dy = -15
+                    elif LAST_PITCH_VALUE < 0:
+                        mouse_dy = 15
                     else:
-                        move_mouse(10, 28)
+                        mouse_dy = 0
+
+                    move_mouse(mouse_dx, mouse_dy)
+
+                    del frame, results, detections, target
                     continue
 
                 force_release_w_key()
@@ -488,28 +591,26 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
                     last_vx = 0.0
                     last_vy = 0.0
 
-            del frame, results, detections, target
+            del frame
+            del results
+            del detections
+            del target
+
             frame_counter += 1
-            if frame_counter % 300 == 0 and YOLO_DEVICE != 'cpu' and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            time.sleep(0.01)
+            if frame_counter % 150 == 0:
+                gc.collect()
+                frame_counter = 0
+
     except KeyboardInterrupt:
         print("\n[종료] 사용자가 중단했습니다.")
     finally:
-        set_s_key_state(False)
-        force_release_w_key()
-        try:
-            hotkeys.stop()
-        except Exception:
-            pass
-        try:
-            listener.stop()
-        except Exception:
-            pass
-        try:
+        stop_all_actions()
+        if SCREEN_CAPTURE is not None:
             SCREEN_CAPTURE.close()
-        except Exception:
-            pass
+        
+        gc.collect()
+        if YOLO_DEVICE != 'cpu' and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         print("\n[종료] 프로그램을 종료합니다.")
 
 
