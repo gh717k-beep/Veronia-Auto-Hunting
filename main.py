@@ -40,6 +40,7 @@ LAST_DETECTION_TIME = 0.0
 DETECTION_LOG_COUNTER = 0
 W_KEY_PRESSED = False
 USER_W_PRESSED = False
+S_KEY_PRESSED = False
 KEYBOARD_CONTROLLER = keyboard.Controller()
 SCREEN_CAPTURE = mss.mss()
 OCR_READER = None
@@ -138,6 +139,22 @@ def click_left_mouse() -> None:
     else:
         ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
         ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
+
+
+def set_s_key_state(should_press: bool) -> None:
+    global S_KEY_PRESSED
+    if should_press and not S_KEY_PRESSED:
+        try:
+            KEYBOARD_CONTROLLER.press('s')
+            S_KEY_PRESSED = True
+        except Exception:
+            pass
+    elif not should_press and S_KEY_PRESSED:
+        try:
+            KEYBOARD_CONTROLLER.release('s')
+            S_KEY_PRESSED = False
+        except Exception:
+            pass
 
 
 def toggle_detection():
@@ -385,17 +402,23 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
                     print(f"[검지] area={target['area']:.1f}, cx={target['cx']:.1f}, cy={target['cy']:.1f}")
 
                 if is_target_offset and target["area"] <= TARGET_ACTION_SIZE:
+                    set_s_key_state(False)
                     press_w_key()
                 else:
                     if target["area"] > TARGET_ACTION_SIZE:
+                        # 객체가 너무 커서 왼쪽 클릭 연타만으로는 맞지 않을 때,
+                        # 크기가 역치에 수렴할 때까지 S를 꾹 누른 상태를 유지한다.
+                        set_s_key_state(True)
                         force_release_w_key()
                         click_left_mouse()
                     else:
+                        set_s_key_state(False)
                         release_w_key()
 
                 last_vx = dx
                 last_vy = dy
             else:
+                set_s_key_state(False)
                 missed_frames += 1
                 if (time.monotonic() - LAST_TARGET_TIME) >= 1.0:
                     if not DIVE_MODE_ACTIVE:
@@ -438,6 +461,7 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
     except KeyboardInterrupt:
         print("\n[종료] 사용자가 중단했습니다.")
     finally:
+        set_s_key_state(False)
         force_release_w_key()
         try:
             hotkeys.stop()
