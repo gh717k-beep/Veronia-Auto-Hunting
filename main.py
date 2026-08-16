@@ -3,8 +3,9 @@ import time
 from pathlib import Path
 
 import cv2
+import mss
 import numpy as np
-from PIL import ImageGrab
+import torch
 from pynput import keyboard
 from ultralytics import YOLO
 
@@ -25,6 +26,106 @@ DECAY = 0.85
 MAX_MISSED_FRAMES = 15
 ACTIVE_DETECTION = False
 EXIT_REQUESTED = False
+TARGET_ACTION_SIZE = 37000
+CLICK_INTERVAL_SECONDS = 0.12
+FRAME_INTERVAL_SECONDS = 0.08
+LAST_CLICK_TIME = 0.0
+LAST_DETECTION_TIME = 0.0
+DETECTION_LOG_COUNTER = 0
+W_KEY_PRESSED = False
+USER_W_PRESSED = False
+KEYBOARD_CONTROLLER = keyboard.Controller()
+SCREEN_CAPTURE = mss.mss()
+
+
+def detect_device():
+    """CUDA 호환성을 검사하고 사용 가능한 장치를 반환"""
+    if not torch.cuda.is_available():
+        print("[장치] CUDA를 사용할 수 없습니다. CPU 모드로 실행합니다.")
+        return 'cpu'
+
+    try:
+        test_tensor = torch.zeros(1, device='cuda')
+        del test_tensor
+        print("[장치] CUDA 호환성 확인 완료. GPU 모드로 실행합니다.")
+        return 0
+    except RuntimeError as e:
+        print(f"[장치] CUDA 호환성 오류: {e}")
+        print("[장치] CPU 모드로 폴백합니다.")
+        return 'cpu'
+
+
+YOLO_DEVICE = detect_device()
+
+
+def on_w_key_down(key):
+    global USER_W_PRESSED
+    try:
+        if key.char == 'w':
+            USER_W_PRESSED = True
+    except (AttributeError, TypeError):
+        pass
+
+
+def on_w_key_up(key):
+    global USER_W_PRESSED
+    try:
+        if key.char == 'w':
+            USER_W_PRESSED = False
+    except (AttributeError, TypeError):
+        pass
+
+
+def set_w_key_state(should_press: bool) -> None:
+    global W_KEY_PRESSED, USER_W_PRESSED
+    effective_should_press = should_press or USER_W_PRESSED
+    
+    if effective_should_press and not W_KEY_PRESSED:
+        try:
+            KEYBOARD_CONTROLLER.press('w')
+            W_KEY_PRESSED = True
+        except Exception:
+            pass
+    elif not effective_should_press and W_KEY_PRESSED:
+        try:
+            KEYBOARD_CONTROLLER.release('w')
+            W_KEY_PRESSED = False
+        except Exception:
+            pass
+
+
+def press_w_key() -> None:
+    set_w_key_state(True)
+
+
+def release_w_key() -> None:
+    set_w_key_state(False)
+
+
+def force_release_w_key() -> None:
+    """사용자 입력 무시하고 W를 강제 해제 (큰 타겟에서 클릭 모드로 전환)"""
+    global W_KEY_PRESSED
+    if W_KEY_PRESSED:
+        try:
+            KEYBOARD_CONTROLLER.release('w')
+            W_KEY_PRESSED = False
+        except Exception:
+            pass
+
+
+def click_left_mouse() -> None:
+    global LAST_CLICK_TIME
+    now = time.monotonic()
+    if now - LAST_CLICK_TIME < CLICK_INTERVAL_SECONDS:
+        return
+    LAST_CLICK_TIME = now
+
+    if win32api and win32con:
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0)
+    else:
+        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
+        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
 
 
 def toggle_detection():
@@ -122,12 +223,10 @@ def move_mouse(delta_x: int, delta_y: int) -> None:
 
 
 def capture_screen() -> np.ndarray:
-    image = np.array(ImageGrab.grab())
-    if image.ndim == 2:
-        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    else:
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    return image
+    monitor = SCREEN_CAPTURE.monitors[1]
+    shot = np.ascontiguousarray(np.array(SCREEN_CAPTURE.grab(monitor), dtype=np.uint8))
+    image = cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
+    return np.ascontiguousarray(image)
 
 
 def select_main_target(detections: list[dict], threshold: float):
@@ -145,8 +244,9 @@ def iterate_targets(results) -> list[dict]:
             continue
 
         for box in result.boxes:
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(float)
-            conf = float(box.conf[0].cpu().item())
+            xyxy = box.xyxy[0].detach().cpu().numpy().astype(float)
+            x1, y1, x2, y2 = xyxy
+            conf = float(box.conf[0].detach().cpu().item())
             width = max(0.0, x2 - x1)
             height = max(0.0, y2 - y1)
             area = width * height
@@ -164,7 +264,7 @@ def iterate_targets(results) -> list[dict]:
 
 
 def run_detection_loop(model_path: Path, threshold: float) -> None:
-    global ACTIVE_DETECTION, EXIT_REQUESTED
+    global ACTIVE_DETECTION, EXIT_REQUESTED, LAST_DETECTION_TIME, DETECTION_LOG_COUNTER
 
     print("========================================")
     print("State 1: 전투 및 고정밀 관성 추적 (Combat & Velocity Tracking Mode)")
@@ -176,37 +276,54 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
     print("- F9: 종료")
 
     model = YOLO(str(model_path))
+    if YOLO_DEVICE != 'cpu':
+        model.to(f'cuda:{YOLO_DEVICE}')
+        model.half()
+    model.eval()
+
     hotkeys = keyboard.GlobalHotKeys({
         '<f8>': toggle_detection,
         '<f9>': request_exit,
     })
     hotkeys.start()
 
+    listener = keyboard.Listener(on_press=on_w_key_down, on_release=on_w_key_up)
+    listener.start()
+
     ema_dx = 0.0
     ema_dy = 0.0
     last_vx = 0.0
     last_vy = 0.0
     missed_frames = 0
+    frame_counter = 0
 
     try:
         while not EXIT_REQUESTED:
             if not ACTIVE_DETECTION:
+                force_release_w_key()
                 time.sleep(0.02)
                 continue
 
-            frame = capture_screen()
-            results = model.track(
-                frame,
-                persist=True,
-                tracker="bytetrack.yaml",
-                conf=threshold,
-                iou=0.45,
-                imgsz=640,
-                verbose=False,
-            )
+            now = time.monotonic()
+            if now - LAST_DETECTION_TIME < FRAME_INTERVAL_SECONDS:
+                time.sleep(0.01)
+                continue
+            LAST_DETECTION_TIME = now
 
-            detections = iterate_targets(results)
-            target = select_main_target(detections, threshold)
+            with torch.inference_mode():
+                frame = capture_screen()
+                results = model.predict(
+                    frame,
+                    conf=threshold,
+                    iou=0.45,
+                    imgsz=640,
+                    device=0 if YOLO_DEVICE != 'cpu' else 'cpu',
+                    verbose=False,
+                    max_det=50,
+                )
+
+                detections = iterate_targets(results)
+                target = select_main_target(detections, threshold)
 
             if target is not None:
                 missed_frames = 0
@@ -216,12 +333,30 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
                 ema_dx = EMA_ALPHA * dx + (1.0 - EMA_ALPHA) * ema_dx
                 ema_dy = EMA_ALPHA * dy + (1.0 - EMA_ALPHA) * ema_dy
 
-                move_mouse(int(ema_dx * 0.62), int(ema_dy * 0.62))
+                mouse_move_x = int(ema_dx * 0.62)
+                mouse_move_y = int(ema_dy * 0.62)
+                is_target_offset = abs(dx) > 2.0 or abs(dy) > 2.0
+
+                move_mouse(mouse_move_x, mouse_move_y)
+
+                DETECTION_LOG_COUNTER += 1
+                if DETECTION_LOG_COUNTER % 6 == 0:
+                    print(f"[검지] area={target['area']:.1f}, cx={target['cx']:.1f}, cy={target['cy']:.1f}")
+
+                if is_target_offset and target["area"] <= TARGET_ACTION_SIZE:
+                    press_w_key()
+                else:
+                    if target["area"] > TARGET_ACTION_SIZE:
+                        force_release_w_key()
+                        click_left_mouse()
+                    else:
+                        release_w_key()
 
                 last_vx = dx
                 last_vy = dy
             else:
                 missed_frames += 1
+                force_release_w_key()
                 if missed_frames <= MAX_MISSED_FRAMES:
                     predicted_dx = int(last_vx * 0.9)
                     predicted_dy = int(last_vy * 0.9)
@@ -232,12 +367,25 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
                     last_vx = 0.0
                     last_vy = 0.0
 
+            del frame, results, detections, target
+            frame_counter += 1
+            if frame_counter % 300 == 0 and YOLO_DEVICE != 'cpu' and torch.cuda.is_available():
+                torch.cuda.empty_cache()
             time.sleep(0.01)
     except KeyboardInterrupt:
         print("\n[종료] 사용자가 중단했습니다.")
     finally:
+        force_release_w_key()
         try:
             hotkeys.stop()
+        except Exception:
+            pass
+        try:
+            listener.stop()
+        except Exception:
+            pass
+        try:
+            SCREEN_CAPTURE.close()
         except Exception:
             pass
         print("\n[종료] 프로그램을 종료합니다.")
