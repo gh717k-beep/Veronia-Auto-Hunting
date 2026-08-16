@@ -1,14 +1,13 @@
 @echo off
-chcp 65001
 cd /d "%~dp0"
-set "PYTHON=%~dp0.venv\Scripts\python.exe"
 
-if not exist "%PYTHON%" (
-    echo .venv Python not found.
-    echo Expected: %PYTHON%
-    pause
-    exit /b 1
+where py >nul 2>nul
+if not errorlevel 1 (
+    py -3 -m pip install -q pynput pillow
+    py -3 capture_mobs.py
+) else (
+    python -m pip install -q pynput pillow
+    python capture_mobs.py
 )
 
-echo Starting capture_mobs.py...
-cmd /k ""%PYTHON%" "%~dp0capture_mobs.py""
+pause

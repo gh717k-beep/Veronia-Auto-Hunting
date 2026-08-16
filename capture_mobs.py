@@ -1,104 +1,132 @@
-import os
-import re
 import time
 from datetime import datetime
+from pathlib import Path
 
-import cv2
-import numpy as np
-from PIL import Image, ImageGrab
+from PIL import ImageGrab
 from pynput import keyboard, mouse
 
+BASE_DIR = Path(__file__).resolve().parent
+SCREENSHOT_DIR = BASE_DIR / "mob_screenshots"
 
-BASE_DIR = os.path.join(os.getcwd(), "mob_screenshots")
-os.makedirs(BASE_DIR, exist_ok=True)
-CAPTURE_COOLDOWN_SEC = 0.25
+monster_name = "unknown_mob"
+ready = False
+stop_requested = False
 
 
 def sanitize_name(name: str) -> str:
-    cleaned = re.sub(r"[^0-9a-zA-Z가-힣_\- ]", "", name).strip()
-    return cleaned or "unnamed_mob"
+    cleaned = name.strip().replace("\\", "_").replace("/", "_")
+    cleaned = cleaned.replace("|", "_").replace(":", "_").replace("*", "_")
+    cleaned = cleaned.replace("?", "_").replace('"', "_").replace("<", "_")
+    cleaned = cleaned.replace(">", "_")
+    cleaned = cleaned.strip(" .")
+    return cleaned or "unknown_mob"
 
 
-def ensure_mob_dir(mob_name: str) -> str:
-    safe_name = sanitize_name(mob_name)
-    mob_dir = os.path.join(BASE_DIR, safe_name)
-    os.makedirs(mob_dir, exist_ok=True)
-    return mob_dir
+def save_screenshot(target_name: str) -> None:
+    folder = SCREENSHOT_DIR / sanitize_name(target_name)
+    folder.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    file_path = folder / f"{now}.png"
+
+    screenshot = ImageGrab.grab()
+    screenshot.save(file_path)
+    print(f"[캡처 완료] {file_path}")
 
 
-def capture_screen():
-    img = np.array(ImageGrab.grab())
-    return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+def list_existing_monsters() -> list[str]:
+    if not SCREENSHOT_DIR.exists():
+        print("[기존 몬스터 목록] 아직 저장된 몬스터 폴더가 없습니다.")
+        return []
+
+    monster_folders = sorted(
+        [p.name for p in SCREENSHOT_DIR.iterdir() if p.is_dir()],
+        key=lambda name: name.lower(),
+    )
+
+    if not monster_folders:
+        print("[기존 몬스터 목록] 아직 저장된 몬스터 폴더가 없습니다.")
+        return []
+
+    print("[기존 몬스터 목록]")
+    for index, monster in enumerate(monster_folders, start=1):
+        png_count = len(list((SCREENSHOT_DIR / monster).glob("*.png")))
+        print(f"  {index}. {monster} ({png_count}장)")
+
+    return monster_folders
 
 
-def get_total_saved_count(mob_dir: str) -> int:
-    if not os.path.isdir(mob_dir):
-        return 0
-    return sum(1 for file in os.listdir(mob_dir) if file.lower().endswith(".png"))
-
-
-def save_capture(mob_dir: str, mob_name: str) -> str:
-    frame = capture_screen()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    file_name = f"{sanitize_name(mob_name)}_{timestamp}.png"
-    path = os.path.join(mob_dir, file_name)
+def on_key_press(key):
+    global ready, stop_requested
 
     try:
-        Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).save(path, format="PNG")
-    except Exception as exc:
-        raise IOError(f"이미지 저장 실패: {path} ({exc})") from exc
-
-    total = get_total_saved_count(mob_dir)
-    print(f"저장: {file_name} | 총 {total}장")
-    return path
-
-
-def main():
-    print("몬스터 스크린샷 수집 모드")
-    print("처음 실행 시 몬스터 이름을 입력하세요.")
-    mob_name = input("몬스터 이름: ").strip()
-    while not mob_name:
-        print("몬스터 이름을 입력해야 합니다.")
-        mob_name = input("몬스터 이름: ").strip()
-
-    mob_dir = ensure_mob_dir(mob_name)
-    print(f"저장 폴더: {mob_dir}")
-    print("마우스 휠 클릭: 캡처, F9: 종료")
-
-    stop = False
-    last_capture_time = 0.0
-
-    def on_click(x, y, button, pressed):
-        nonlocal last_capture_time
-        if not pressed:
-            return
-        if button != mouse.Button.middle:
+        if key == keyboard.Key.f8:
+            ready = not ready
+            print(f"[준비 상태] {'활성화' if ready else '비활성화'}")
             return
 
-        now = time.perf_counter()
-        if now - last_capture_time < CAPTURE_COOLDOWN_SEC:
-            return
-        last_capture_time = now
+        if key == keyboard.Key.f9:
+            stop_requested = True
+            print("[종료] F9 눌림. 프로그램을 정지합니다.")
+            return False
+    except AttributeError:
+        pass
 
-        try:
-            save_capture(mob_dir, mob_name)
-        except Exception as exc:
-            print(f"저장 실패: {exc}")
 
-    def on_press(key):
-        nonlocal stop
-        try:
-            if key == keyboard.Key.f9:
-                stop = True
-                print("수집 종료")
-                return False
-        except AttributeError:
-            pass
+def on_mouse_click(x, y, button, pressed):
+    global ready
 
-    with mouse.Listener(on_click=on_click) as mouse_listener, keyboard.Listener(on_press=on_press) as key_listener:
-        while not stop:
-            time.sleep(0.05)
+    if not ready:
+        return
+
+    if button == mouse.Button.middle and pressed:
+        save_screenshot(monster_name)
+
+
+def main() -> None:
+    global monster_name
+
+    SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("========================================")
+    print("몹 스크린샷 캡처기")
+    print("========================================")
+    print("- 몬스터 이름 입력 후 엔터")
+    print("- F8: 준비 상태 ON/OFF")
+    print("- 마우스 휠 버튼: 현재 화면 캡처")
+    print("- F9: 종료")
+    print("========================================")
+
+    list_existing_monsters()
+    print("========================================")
+
+    monster_name = input("몬스터 이름을 입력하세요: ").strip() or "unknown_mob"
+    monster_name = sanitize_name(monster_name)
+    print(f"[대상] {monster_name}")
+    print(f"[저장 경로] {SCREENSHOT_DIR / monster_name}")
+    print("F8 키를 눌러 준비 상태로 들어간 뒤, 마우스 휠 버튼을 눌러 캡처하세요.")
+
+    keyboard_listener = keyboard.Listener(on_press=on_key_press)
+    mouse_listener = mouse.Listener(on_click=on_mouse_click)
+
+    keyboard_listener.start()
+    mouse_listener.start()
+
+    while not stop_requested:
+        time.sleep(0.1)
+
+    keyboard_listener.stop()
+    mouse_listener.stop()
+    keyboard_listener.join()
+    mouse_listener.join()
+    print("프로그램 종료")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[강제 종료] 사용자가 Ctrl+C를 눌렀습니다.")
+    except Exception as exc:
+        print(f"[오류] {exc}")
+        input("엔터를 눌러 종료하세요...")
