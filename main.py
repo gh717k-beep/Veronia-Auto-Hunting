@@ -5,6 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import ImageGrab
+from pynput import keyboard
 from ultralytics import YOLO
 
 try:
@@ -22,6 +23,31 @@ SCREEN_CENTER_Y = 540
 EMA_ALPHA = 0.28
 DECAY = 0.85
 MAX_MISSED_FRAMES = 15
+ACTIVE_DETECTION = False
+EXIT_REQUESTED = False
+
+
+def toggle_detection():
+    global ACTIVE_DETECTION
+    ACTIVE_DETECTION = not ACTIVE_DETECTION
+    status = "활성화" if ACTIVE_DETECTION else "비활성화"
+    print(f"[F8] 탐지 {status}")
+
+
+def request_exit():
+    global EXIT_REQUESTED
+    EXIT_REQUESTED = True
+    print("[F9] 종료 요청")
+
+
+def on_key_press(key):
+    try:
+        if key == keyboard.Key.f8:
+            toggle_detection()
+        elif key == keyboard.Key.f9:
+            request_exit()
+    except AttributeError:
+        pass
 
 
 def list_model_paths() -> list[Path]:
@@ -138,15 +164,23 @@ def iterate_targets(results) -> list[dict]:
 
 
 def run_detection_loop(model_path: Path, threshold: float) -> None:
+    global ACTIVE_DETECTION, EXIT_REQUESTED
+
     print("========================================")
     print("State 1: 전투 및 고정밀 관성 추적 (Combat & Velocity Tracking Mode)")
     print("========================================")
     print(f"모델: {model_path}")
     print(f"유사도 역치: {threshold:.2f}")
     print("- YOLOv8 + ByteTrack 기준으로 가장 큰 바운딩 박스를 메인 타겟으로 선택합니다.")
-    print("- Ctrl + C 로 종료합니다.")
+    print("- F8: 탐지 활성화/비활성화")
+    print("- F9: 종료")
 
     model = YOLO(str(model_path))
+    hotkeys = keyboard.GlobalHotKeys({
+        '<f8>': toggle_detection,
+        '<f9>': request_exit,
+    })
+    hotkeys.start()
 
     ema_dx = 0.0
     ema_dy = 0.0
@@ -155,7 +189,11 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
     missed_frames = 0
 
     try:
-        while True:
+        while not EXIT_REQUESTED:
+            if not ACTIVE_DETECTION:
+                time.sleep(0.02)
+                continue
+
             frame = capture_screen()
             results = model.track(
                 frame,
@@ -197,6 +235,12 @@ def run_detection_loop(model_path: Path, threshold: float) -> None:
             time.sleep(0.01)
     except KeyboardInterrupt:
         print("\n[종료] 사용자가 중단했습니다.")
+    finally:
+        try:
+            hotkeys.stop()
+        except Exception:
+            pass
+        print("\n[종료] 프로그램을 종료합니다.")
 
 
 def main() -> None:
